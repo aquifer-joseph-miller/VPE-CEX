@@ -4,6 +4,7 @@ from assistants import ASSISTANT_MAP
 from feedback_assistants import FEEDBACK_ASSISTANTS
 from patient_prompts import get_patient_prompt
 import time
+import io
 
 # Configuration
 MIN_MESSAGES_FOR_FEEDBACK = 5
@@ -33,6 +34,8 @@ class VPEApp:
             st.session_state.messages = []
         if "thread_id" not in st.session_state:
             st.session_state.thread_id = self.create_thread()
+        if "last_audio_bytes" not in st.session_state:
+            st.session_state.last_audio_bytes = None
         # Don't set selected_actor to None - let it be unset initially
     
     def create_thread(self):
@@ -54,6 +57,7 @@ class VPEApp:
             st.session_state.selected_actor = current_actor
             st.session_state.messages = []
             st.session_state.thread_id = self.create_thread()
+            st.session_state.last_audio_bytes = None
             
             # Optional: Show confirmation message
             if previous_actor is not None:  # Not the first load
@@ -83,6 +87,25 @@ class VPEApp:
                 st.stop()
         
         return feedback_key
+    
+    def transcribe_audio(self, audio_bytes):
+        """Transcribe audio using OpenAI Whisper API."""
+        try:
+            # Create a file-like object from the audio bytes
+            audio_file = io.BytesIO(audio_bytes)
+            audio_file.name = "audio.wav"  # Whisper needs a filename
+            
+            # Call Whisper API
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language="en"  # Optional: specify language for better accuracy
+            )
+            
+            return transcript.text
+        except Exception as e:
+            st.error(f"Transcription failed: {e}")
+            return None
     
     def get_transcript(self, thread_id):
         """Retrieve and format conversation transcript."""
@@ -289,6 +312,24 @@ Transcript of the student's chat with virtual standardized patient {patient_name
         """Count user messages in the current conversation."""
         return sum(1 for msg in st.session_state.messages if msg["role"] == "user")
     
+    def handle_user_input(self, prompt, assistant_id):
+        """Process user input (text or transcribed speech) and get response."""
+        # Add user message to display
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display the message immediately
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Get response from virtual patient
+        response = self.send_message_to_patient(prompt, assistant_id)
+        
+        if response:
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            with st.chat_message("assistant"):
+                st.markdown(response)
+            st.rerun()
+    
     def run(self):
         """Main application loop."""
         st.title("Virtual Patient Encounters (VPE)")
@@ -337,18 +378,43 @@ Transcript of the student's chat with virtual standardized patient {patient_name
         # Display chat history
         self.display_chat_history()
         
-        # Chat input
-        if prompt := st.chat_input("Start chatting with the virtual patient..."):
-            # Add user message to display
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            st.chat_message("user").markdown(prompt)
+        # Input section with both text and voice options
+        st.markdown("### 💬 Your Input")
+        
+        # Create two columns for text and voice input
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            text_input = st.chat_input("Type your message or use the voice button →")
+        
+        with col2:
+            st.markdown("<div style='margin-top: -10px;'>", unsafe_allow_html=True)
+            audio_input = st.audio_input("🎤 Voice", key="voice_input")
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Handle text input
+        if text_input:
+            self.handle_user_input(text_input, assistant_id)
+        
+        # Handle voice input
+        elif audio_input is not None:
+            # Check if this is new audio (different from last processed)
+            audio_bytes = audio_input.getvalue()
             
-            # Get response from virtual patient
-            response = self.send_message_to_patient(prompt, assistant_id)
-            
-            if response:
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                st.chat_message("assistant").markdown(response)
+            if audio_bytes != st.session_state.last_audio_bytes:
+                st.session_state.last_audio_bytes = audio_bytes
+                
+                with st.spinner("🎙️ Transcribing your audio..."):
+                    transcribed_text = self.transcribe_audio(audio_bytes)
+                
+                if transcribed_text:
+                    # Show what was transcribed
+                    st.info(f"**You said:** {transcribed_text}")
+                    
+                    # Process the transcribed text
+                    self.handle_user_input(transcribed_text, assistant_id)
+                else:
+                    st.error("Could not transcribe audio. Please try again.")
         
         # Feedback section
         user_count = self.get_user_message_count()
